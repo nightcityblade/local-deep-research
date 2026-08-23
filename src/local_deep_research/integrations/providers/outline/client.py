@@ -7,7 +7,7 @@ import urllib.request
 from types import TracebackType
 from typing import Any
 
-from .config import OutlineProviderConfig
+from .config import OutlineProviderConfig, assert_egress_allowed
 from .errors import OutlineConnectionError, OutlineProtocolError
 
 _MAX_JSON_BYTES = 32 * 1024 * 1024  # 32 MiB response-body ceiling.
@@ -46,6 +46,7 @@ class OutlineClient:
     def __init__(self, config: OutlineProviderConfig) -> None:
         self._config = config
         self._collections_cache: dict[str, str] | None = None
+        self._egress_checked = False
 
     def __enter__(self) -> OutlineClient:
         return self
@@ -103,7 +104,8 @@ class OutlineClient:
         """Resolve a collection UUID to its name.
 
         Collections are fetched once per client lifetime and cached.
-        Unknown or missing collections resolve to an empty string.
+        Unknown, missing or malformed collections resolve to an empty
+        string rather than failing the sync.
         """
         if self._collections_cache is None:
             cache: dict[str, str] = {}
@@ -116,10 +118,15 @@ class OutlineClient:
                 if not batch:
                     break
                 for collection in batch:
+                    # Fail open per row. This is a display-name lookup on
+                    # the per-document path, so one malformed row must not
+                    # deny the whole sync - and raising here also left
+                    # ``_collections_cache`` unset, so every remaining
+                    # document retried the entire listing. Rows whose id or
+                    # name is not a string are already skipped below; a
+                    # non-dict row is the same class of defect.
                     if not isinstance(collection, dict):
-                        raise OutlineProtocolError(
-                            "collection_entry_not_object"
-                        )
+                        continue
                     collection_id_value = collection.get("id")
                     name = collection.get("name")
                     if isinstance(collection_id_value, str) and isinstance(
@@ -151,8 +158,19 @@ class OutlineClient:
         return data
 
     def _request(self, action: str, body: dict[str, Any]) -> Any:
+        self._assert_egress_allowed()
         url = f"{self._config.api_url}/{action}"
         payload = json.dumps(body).encode("utf-8")
+        # ``http.client`` rejects a malformed header value with a
+        # ``ValueError`` - or, for a non-Latin-1 character, a
+        # ``UnicodeEncodeError`` - that carries the whole header, including
+        # the bearer token. The replacement is built here and raised *after*
+        # the handler has exited: ``raise ... from None`` only sets
+        # ``__suppress_context__``, which stops the traceback module from
+        # printing the chain while leaving the original exception (and the
+        # token in its ``args``/``object``) reachable through
+        # ``error.__context__``.
+        header_error: OutlineProtocolError | None = None
         try:
             req = urllib.request.Request(  # noqa: S310
                 url,
@@ -175,11 +193,9 @@ class OutlineClient:
         except (OSError, socket.gaierror, TimeoutError) as error:
             raise OutlineConnectionError("connect_failed") from error
         except ValueError:
-            # ``http.client`` rejects a malformed header value with a
-            # ``ValueError`` whose message quotes the header - including the
-            # bearer token. Re-raise with a static rule and no ``__cause__``
-            # so the token cannot ride out in a message or a traceback.
-            raise OutlineProtocolError("invalid_request") from None
+            header_error = OutlineProtocolError("invalid_request")
+        if header_error is not None:
+            raise header_error
 
         if len(raw) > _MAX_JSON_BYTES:
             raise OutlineProtocolError("response_too_large")
@@ -192,3 +208,17 @@ class OutlineClient:
         if not isinstance(envelope, dict) or "data" not in envelope:
             raise OutlineProtocolError("envelope_missing_data")
         return envelope["data"]
+
+    def _assert_egress_allowed(self) -> None:
+        """Re-check the egress policy once per client, fail-closed.
+
+        Configuration time tolerates a host that does not resolve; that
+        leniency is a bypass on its own (SERVFAIL while the config is
+        saved, ``127.0.0.1`` afterwards). A client is constructed for one
+        sync, so checking on its first request keeps the guarantee without
+        paying a resolver round trip per page.
+        """
+        if self._egress_checked:
+            return
+        assert_egress_allowed(self._config.base_url)
+        self._egress_checked = True
