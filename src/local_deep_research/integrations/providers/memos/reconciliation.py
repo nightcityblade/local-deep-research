@@ -1,10 +1,11 @@
 """Memos snapshot reconciliation.
 
 Known limitation: ``provider_revision`` is derived from the server's own
-change markers (``updateTime`` and the pinned flag) and never hashes the item's content. The listing
-endpoint does not return content, so hashing it would cost one extra request
-per item on every sync. A server that omits those markers therefore reports a
-constant revision for every item and edits are not re-synced.
+change markers (``updateTime`` and the pinned flag) and never hashes the
+item's content. The listing endpoint does not return content, so hashing it
+would cost one extra request per item on every sync. A server that omits
+those markers therefore reports a constant revision for every item and edits
+are not re-synced.
 """
 
 from __future__ import annotations
@@ -56,9 +57,6 @@ def fetch_memos_snapshot(client: MemosClient) -> RemoteSnapshot:
         all_memos.extend(batch)
         if not page_token:
             break
-        if config.max_memos > 0 and len(all_memos) >= config.max_memos:
-            # The cap bounds the fetch itself, not just the result.
-            break
         if len(all_memos) > _MAX_PAGINATED_MEMOS:
             raise MemosProtocolError("pagination_not_terminating")
 
@@ -87,13 +85,21 @@ def fetch_memos_snapshot(client: MemosClient) -> RemoteSnapshot:
                 revision=revision,
             )
         )
+    # ``RemoteSnapshot`` validates ``item_ids == sorted(item_ids)``, so the
+    # lexicographic order is both the emitted order and the selection order.
+    # Memos names (``memos/<uid>``) are not plain integers, so unlike
+    # Linkwarden there is no numeric order to prefer.
     items.sort(key=lambda si: si.external_id)
     if not items:
         raise MemosProtocolError("no_valid_memos")
     if config.max_memos > 0:
-        # Truncate after sorting: truncating the server's own listing order
-        # would select a different subset whenever that order changes, and
-        # items missing from a snapshot are marked for removal.
+        # Select only after fetching the whole listing, and never bound the
+        # fetch by the cap. Items missing from a snapshot are marked
+        # ``pending_removal``, so any selection that depends on the
+        # server's listing order - including an early break once the cap is
+        # reached - makes the retained set flap between syncs whenever that
+        # order changes. ``_MAX_PAGINATED_MEMOS``, not the cap, is what
+        # bounds a non-terminating server.
         items = items[: config.max_memos]
 
     triples = [

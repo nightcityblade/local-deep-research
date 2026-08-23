@@ -8,7 +8,7 @@ import urllib.request
 from types import TracebackType
 from typing import Any
 
-from .config import MemosProviderConfig
+from .config import MemosProviderConfig, assert_egress_allowed
 from .errors import MemosConnectionError, MemosProtocolError
 
 _MAX_JSON_BYTES = 32 * 1024 * 1024  # 32 MiB response-body ceiling.
@@ -42,6 +42,7 @@ class MemosClient:
 
     def __init__(self, config: MemosProviderConfig) -> None:
         self._config = config
+        self._egress_checked = False
 
     def __enter__(self) -> MemosClient:
         return self
@@ -106,9 +107,20 @@ class MemosClient:
         """No persistent resources to clean up."""
 
     def _get_json(self, path: str, params: dict[str, str] | None) -> Any:
+        self._assert_egress_allowed()
         url = f"{self._config.api_url}/{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
+        # ``http.client`` rejects a malformed header value with a
+        # ``ValueError`` - or, for a non-Latin-1 character, a
+        # ``UnicodeEncodeError`` - that carries the whole header, including
+        # the bearer token. The replacement is built here and raised *after*
+        # the handler has exited: ``raise ... from None`` only sets
+        # ``__suppress_context__``, which stops the traceback module from
+        # printing the chain while leaving the original exception (and the
+        # token in its ``args``/``object``) reachable through
+        # ``error.__context__``.
+        header_error: MemosProtocolError | None = None
         try:
             req = urllib.request.Request(  # noqa: S310
                 url,
@@ -129,11 +141,9 @@ class MemosClient:
         except (OSError, socket.gaierror, TimeoutError) as error:
             raise MemosConnectionError("connect_failed") from error
         except ValueError:
-            # ``http.client`` rejects a malformed header value with a
-            # ``ValueError`` whose message quotes the header - including the
-            # bearer token. Re-raise with a static rule and no ``__cause__``
-            # so the token cannot ride out in a message or a traceback.
-            raise MemosProtocolError("invalid_request") from None
+            header_error = MemosProtocolError("invalid_request")
+        if header_error is not None:
+            raise header_error
 
         if len(raw) > _MAX_JSON_BYTES:
             raise MemosProtocolError("response_too_large")
@@ -143,3 +153,17 @@ class MemosClient:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise MemosProtocolError("json_decode_error") from error
+
+    def _assert_egress_allowed(self) -> None:
+        """Re-check the egress policy once per client, fail-closed.
+
+        Configuration time tolerates a host that does not resolve; that
+        leniency is a bypass on its own (SERVFAIL while the config is
+        saved, ``127.0.0.1`` afterwards). A client is constructed for one
+        sync, so checking on its first request keeps the guarantee without
+        paying a resolver round trip per page.
+        """
+        if self._egress_checked:
+            return
+        assert_egress_allowed(self._config.base_url)
+        self._egress_checked = True

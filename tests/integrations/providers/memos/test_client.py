@@ -21,6 +21,7 @@ from local_deep_research.integrations.providers.memos.config import (
 from local_deep_research.integrations.providers.memos.errors import (
     MemosConnectionError,
     MemosProtocolError,
+    MemosProviderError,
 )
 
 
@@ -246,17 +247,35 @@ def test_no_redirect_handler_blocks_3xx() -> None:
     assert redirected is None
 
 
-def test_response_too_large_raises() -> None:
-    """Responses larger than the configured ceiling raise ``response_too_large``."""
+def test_response_too_large_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body over the ceiling raises ``response_too_large``.
+
+    Driven through the real client: an in-test re-implementation of the
+    ceiling check passes even with the ceiling deleted from ``client.py``.
+    The ceiling is shrunk rather than allocating 32 MiB per run.
+    """
     from local_deep_research.integrations.providers.memos import (
         client as client_mod,
     )
 
-    fake_response = io.BytesIO(b"x" * (client_mod._MAX_JSON_BYTES + 1))
-    chunk = fake_response.read(client_mod._MAX_JSON_BYTES + 1)
+    monkeypatch.setattr(client_mod, "_MAX_JSON_BYTES", 8)
+    _install_urlopen(monkeypatch, b"x" * 9, [])
     with pytest.raises(MemosProtocolError, match="response_too_large"):
-        if len(chunk) > client_mod._MAX_JSON_BYTES:
-            raise MemosProtocolError("response_too_large")
+        MemosClient(_config()).probe()
+
+
+def test_response_at_the_ceiling_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body exactly at the ceiling is still parsed."""
+    from local_deep_research.integrations.providers.memos import (
+        client as client_mod,
+    )
+
+    body = json.dumps({"memos": [], "nextPageToken": ""}).encode()
+    monkeypatch.setattr(client_mod, "_MAX_JSON_BYTES", len(body))
+    _install_urlopen(monkeypatch, body, [])
+    MemosClient(_config()).probe()
 
 
 def test_get_memo_url_encodes_uid_unsafe_chars(
@@ -277,25 +296,82 @@ def test_get_memo_url_encodes_uid_unsafe_chars(
     assert "/memos/a/b" not in req.full_url.split("?")[0]
 
 
-def test_transport_value_error_never_leaks_the_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``http.client`` quotes the whole header value in its ``ValueError``.
+def _chain_texts(error: BaseException) -> list[str]:
+    """Every string an error reporter could pull out of an exception chain."""
+    texts: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        texts += [repr(current), str(current), repr(current.args)]
+        # ``UnicodeEncodeError.object`` holds the whole offending string.
+        payload = getattr(current, "object", None)
+        if payload is not None:
+            texts.append(repr(payload))
+        pending += [current.__context__, current.__cause__]
+    return texts
 
-    That message carries the bearer token, so it must be converted to a
-    static rule code and its context suppressed rather than escaping the
-    provider's error taxonomy.
-    """
-    _install_urlopen_error(
-        monkeypatch,
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
         ValueError("Invalid header value b'Bearer secret-token\\n'"),
-    )
+        # ``putheader`` encodes the value as latin-1; a non-Latin-1
+        # character raises this ``ValueError`` subclass, whose ``object``
+        # attribute is the whole ``Bearer <token>`` string.
+        UnicodeEncodeError(
+            "latin-1",
+            "Bearer secret-token\u0151",
+            19,
+            20,
+            "ordinal not in range(256)",
+        ),
+    ],
+    ids=["invalid-header-value", "non-latin-1-token"],
+)
+def test_transport_value_error_never_leaks_the_token(
+    monkeypatch: pytest.MonkeyPatch, transport_error: BaseException
+) -> None:
+    """The token must not survive anywhere in the raised exception chain.
+
+    ``raise ... from None`` is not enough: it sets ``__suppress_context__``,
+    which only stops the traceback module from *printing* the chain, while
+    ``error.__context__`` still holds the original exception with the token
+    in its ``args`` (or, for ``UnicodeEncodeError``, in ``.object``). A
+    structured error reporter or any ``while error.__context__`` walker
+    reads it straight back out.
+    """
+    _install_urlopen_error(monkeypatch, transport_error)
     with pytest.raises(MemosProtocolError) as excinfo:
         MemosClient(_config()).probe()
     assert str(excinfo.value) == "memos_protocol:invalid_request"
-    assert "secret-token" not in str(excinfo.value)
     assert excinfo.value.__cause__ is None
-    assert excinfo.value.__suppress_context__ is True
+    assert excinfo.value.__context__ is None
+    for text in _chain_texts(excinfo.value):
+        assert "secret-token" not in text, text
+
+
+def test_request_to_an_unresolvable_host_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config time tolerates an unresolvable host; request time must not.
+
+    Otherwise an attacker whose nameserver SERVFAILs while the config is
+    saved, and answers ``127.0.0.1`` afterwards, reaches loopback with no
+    allowlist entry - there is no address pinning, so ``urllib``
+    re-resolves on every call.
+    """
+    monkeypatch.delenv("LDR_INTEGRATIONS_ALLOWED_ORIGINS", raising=False)
+    # Accepted at construction time (the conftest stub NXDOMAINs .invalid).
+    config = MemosProviderConfig(
+        base_url="https://memos.invalid", api_token="t"
+    )
+    _install_urlopen(monkeypatch, json.dumps({"memos": []}).encode(), [])
+    with pytest.raises(MemosProviderError, match="base_url_unresolvable"):
+        MemosClient(config).probe()
 
 
 def test_repr_labels_the_base_url_field() -> None:

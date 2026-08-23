@@ -139,16 +139,36 @@ def test_snapshot_respects_max_memos() -> None:
     )
 
 
-def test_snapshot_max_memos_bounds_the_fetch() -> None:
-    """The cap stops paging; it is not applied after fetching everything."""
-    client = _FakeClient(
-        pages=[([_memo("a"), _memo("b")], "same-token")] * 5,
-        memos={},
-        config=_config(max_memos=2),
+def test_snapshot_max_memos_is_stable_across_server_listing_order() -> None:
+    """The retained subset must not depend on the server's listing order.
+
+    Bounding the *fetch* by the cap re-introduces exactly the dependence
+    that sorting removes: with ``max_memos=2`` a first page of ``[d, c]``
+    stops paging and keeps ``("memos/c", "memos/d")``, while a reordered
+    first page of ``[a, b]`` keeps ``("memos/a", "memos/b")``. Those sets
+    are disjoint, so all four items flap in and out of ``pending_removal``
+    on alternate syncs. ``_MAX_PAGINATED_MEMOS`` - not the cap - bounds a
+    runaway server.
+    """
+    pages = [([_memo("d"), _memo("c")], "t"), ([_memo("a"), _memo("b")], "")]
+    reordered = [
+        ([_memo("a"), _memo("b")], "t"),
+        ([_memo("d"), _memo("c")], ""),
+    ]
+    forward = _FakeClient(pages=pages, memos={}, config=_config(max_memos=2))
+    backward = _FakeClient(
+        pages=reordered, memos={}, config=_config(max_memos=2)
     )
-    snapshot = fetch_memos_snapshot(client)
-    assert snapshot.expected_count == 2
-    assert len(client.list_calls) == 1
+
+    forward_ids = tuple(
+        item.external_id for item in fetch_memos_snapshot(forward).items
+    )
+    backward_ids = tuple(
+        item.external_id for item in fetch_memos_snapshot(backward).items
+    )
+    assert forward_ids == backward_ids == ("memos/a", "memos/b")
+    # Both orderings paged all the way to the end before truncating.
+    assert len(forward.list_calls) == len(backward.list_calls) == 2
 
 
 def test_snapshot_terminates_on_empty_page_with_a_repeating_token() -> None:
