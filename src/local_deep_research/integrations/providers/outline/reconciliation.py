@@ -1,3 +1,12 @@
+"""Outline snapshot reconciliation.
+
+Known limitation: ``provider_revision`` is derived from the server's own
+change markers (``updatedAt`` and the owning collection id) and never hashes the item's content. The listing
+endpoint does not return content, so hashing it would cost one extra request
+per item on every sync. A server that omits those markers therefore reports a
+constant revision for every item and edits are not re-synced.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +19,10 @@ from .client import OutlineClient
 from .errors import OutlineProtocolError
 
 _PAGE_SIZE = 100
+
+# Safety valve against a server that keeps returning a full page forever;
+# exposed as a module constant for tests.
+_MAX_PAGINATED_DOCUMENTS = 500_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +52,20 @@ def fetch_outline_snapshot(client: OutlineClient) -> RemoteSnapshot:
             limit=_PAGE_SIZE,
             collection_id=config.collection_id,
         )
+        if not batch:
+            break
         all_documents.extend(batch)
         if len(batch) < _PAGE_SIZE:
             break
         offset += len(batch)
-
-    if config.max_documents > 0 and len(all_documents) > config.max_documents:
-        all_documents = all_documents[: config.max_documents]
+        if (
+            config.max_documents > 0
+            and len(all_documents) >= config.max_documents
+        ):
+            # The cap bounds the fetch itself, not just the result.
+            break
+        if len(all_documents) > _MAX_PAGINATED_DOCUMENTS:
+            raise OutlineProtocolError("pagination_not_terminating")
 
     if not all_documents:
         raise OutlineProtocolError("no_documents")
@@ -53,6 +73,8 @@ def fetch_outline_snapshot(client: OutlineClient) -> RemoteSnapshot:
     items: list[RemoteSnapshotItem] = []
     seen: set[str] = set()
     for document in all_documents:
+        if not isinstance(document, dict):
+            raise OutlineProtocolError("document_entry_not_object")
         document_id = str(document.get("id", ""))
         if not document_id or document_id in seen:
             continue
@@ -73,6 +95,11 @@ def fetch_outline_snapshot(client: OutlineClient) -> RemoteSnapshot:
     items.sort(key=lambda si: si.external_id)
     if not items:
         raise OutlineProtocolError("no_valid_documents")
+    if config.max_documents > 0:
+        # Truncate after sorting: truncating the server's own listing order
+        # would select a different subset whenever that order changes, and
+        # items missing from a snapshot are marked for removal.
+        items = items[: config.max_documents]
 
     triples = [
         [si.external_id, si.provider_revision, si.revision] for si in items

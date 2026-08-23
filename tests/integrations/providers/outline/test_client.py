@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
+import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -62,21 +65,29 @@ def _request_of(captured: list) -> object:
 
 
 class TestRequestShape:
-    def test_probe_posts_auth_info_with_bearer(
+    def test_probe_lists_one_document_with_bearer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """The probe must exercise the endpoint the sync actually calls.
+
+        ``auth.info`` succeeds for any valid token, so it reported
+        "connection successful" while ``documents.list`` returned 403.
+        """
         captured: list = []
         _install_urlopen(
             monkeypatch,
-            json.dumps({"data": {"user": {"id": "u1"}}}).encode(),
+            json.dumps({"data": []}).encode(),
             captured,
         )
         OutlineClient(_config()).probe()
         req = _request_of(captured)
-        assert req.full_url == "https://wiki.example.com/api/auth.info"
+        assert req.full_url == "https://wiki.example.com/api/documents.list"
         assert req.get_method() == "POST"
         assert req.get_header("Authorization") == "Bearer secret-token"
-        assert json.loads(req.data.decode("utf-8")) == {}
+        assert json.loads(req.data.decode("utf-8")) == {
+            "offset": 0,
+            "limit": 1,
+        }
 
     def test_list_documents_sends_pagination_and_filter(
         self, monkeypatch: pytest.MonkeyPatch
@@ -144,13 +155,13 @@ class TestRequestShape:
 
 
 class TestEnvelopeParsing:
-    def test_probe_data_without_user_raises(
+    def test_probe_data_not_a_list_raises(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _install_urlopen(
             monkeypatch, json.dumps({"data": {"teams": []}}).encode(), []
         )
-        with pytest.raises(OutlineProtocolError, match="auth_info_invalid"):
+        with pytest.raises(OutlineProtocolError, match="documents_not_list"):
             OutlineClient(_config()).probe()
 
     def test_envelope_without_data_key_raises(
@@ -189,7 +200,7 @@ class TestEnvelopeParsing:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _install_urlopen(monkeypatch, b"", [])
-        with pytest.raises(OutlineProtocolError, match="auth_info_invalid"):
+        with pytest.raises(OutlineProtocolError, match="documents_not_list"):
             OutlineClient(_config()).probe()
 
 
@@ -266,3 +277,133 @@ def test_response_too_large_raises() -> None:
     with pytest.raises(OutlineProtocolError, match="response_too_large"):
         if len(chunk) > client_mod._MAX_JSON_BYTES:
             raise OutlineProtocolError("response_too_large")
+
+
+def _install_paged_urlopen(
+    monkeypatch: pytest.MonkeyPatch, bodies: list[bytes], captured: list
+) -> None:
+    def _fake_urlopen(req: object, timeout: int | None = None) -> io.BytesIO:
+        captured.append(req)
+        index = min(len(captured) - 1, len(bodies) - 1)
+        return io.BytesIO(bodies[index])
+
+    monkeypatch.setattr(
+        "local_deep_research.integrations.providers.outline.client._OPENER"
+        ".open",
+        _fake_urlopen,
+    )
+
+
+def test_collections_pagination_terminates_on_empty_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty page ends the collections loop even at a page boundary."""
+    from local_deep_research.integrations.providers.outline import (
+        client as client_mod,
+    )
+
+    full_page = json.dumps(
+        {
+            "data": [
+                {"id": f"c{i}", "name": f"N{i}"}
+                for i in range(client_mod._COLLECTIONS_PAGE_SIZE)
+            ]
+        }
+    ).encode()
+    captured: list = []
+    _install_paged_urlopen(
+        monkeypatch, [full_page, json.dumps({"data": []}).encode()], captured
+    )
+    assert OutlineClient(_config()).get_collection_name("c0") == "N0"
+    assert len(captured) == 2
+
+
+def test_collections_pagination_valve_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server replaying a full page forever must trip the safety valve.
+
+    The valve counts rows fetched, not rows cached: replaying the *same*
+    page never grows the cache, so a cache-size check would still spin.
+    """
+    from local_deep_research.integrations.providers.outline import (
+        client as client_mod,
+    )
+
+    monkeypatch.setattr(client_mod, "_MAX_PAGINATED_COLLECTIONS", 150)
+    full_page = json.dumps(
+        {
+            "data": [
+                {"id": f"c{i}", "name": f"N{i}"}
+                for i in range(client_mod._COLLECTIONS_PAGE_SIZE)
+            ]
+        }
+    ).encode()
+    _install_paged_urlopen(monkeypatch, [full_page], [])
+    with pytest.raises(
+        OutlineProtocolError, match="pagination_not_terminating"
+    ):
+        OutlineClient(_config()).get_collection_name("c0")
+
+
+def test_collections_non_dict_entry_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-dict collection element must stay inside the error taxonomy."""
+    _install_urlopen(monkeypatch, json.dumps({"data": ["nope"]}).encode(), [])
+    with pytest.raises(
+        OutlineProtocolError, match="collection_entry_not_object"
+    ):
+        OutlineClient(_config()).get_collection_name("c1")
+
+
+def test_transport_value_error_never_leaks_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``http.client`` quotes the whole header value in its ``ValueError``.
+
+    That message carries the bearer token, so it must be converted to a
+    static rule code and its context suppressed rather than escaping the
+    provider's error taxonomy.
+    """
+    _install_urlopen_error(
+        monkeypatch,
+        ValueError("Invalid header value b'Bearer secret-token\\n'"),
+    )
+    with pytest.raises(OutlineProtocolError) as excinfo:
+        OutlineClient(_config()).probe()
+    assert str(excinfo.value) == "outline_protocol:invalid_request"
+    assert "secret-token" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_opener_ignores_environment_proxies() -> None:
+    """``http_proxy``/``https_proxy``/``ALL_PROXY`` must not capture traffic.
+
+    The opener is built at import time, so the check runs in a subprocess
+    with the proxy variables set: urllib's default ``ProxyHandler`` would
+    register itself from the environment and route token-bearing requests
+    through a third party.
+    """
+    code = (
+        "import urllib.request\n"
+        "from local_deep_research.integrations.providers.outline "
+        "import client as c\n"
+        "print(any(isinstance(h, urllib.request.ProxyHandler) "
+        "for h in c._OPENER.handlers))\n"
+    )
+    env = {
+        **os.environ,
+        "http_proxy": "http://proxy.invalid:3128",
+        "https_proxy": "http://proxy.invalid:3128",
+        "ALL_PROXY": "http://proxy.invalid:3128",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "False", result.stderr

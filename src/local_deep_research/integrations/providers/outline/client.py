@@ -11,6 +11,10 @@ from .config import OutlineProviderConfig
 from .errors import OutlineConnectionError, OutlineProtocolError
 
 _MAX_JSON_BYTES = 32 * 1024 * 1024  # 32 MiB response-body ceiling.
+_COLLECTIONS_PAGE_SIZE = 100
+# Safety valve against a server that keeps returning a full page of
+# collections forever; exposed as a module constant for tests.
+_MAX_PAGINATED_COLLECTIONS = 500_000
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -21,7 +25,14 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# ``ProxyHandler({})`` replaces urllib's default handler, which reads
+# ``http_proxy``/``https_proxy``/``ALL_PROXY`` from the environment. Integration
+# traffic carries a bearer token, so it must never be routed through a third
+# party because of an unrelated environment variable (the project uses
+# ``trust_env = False`` for the same reason elsewhere).
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
 
 
 class OutlineClient:
@@ -55,10 +66,15 @@ class OutlineClient:
         return self._config
 
     def probe(self) -> None:
-        """Verify connectivity and credentials via ``auth.info``."""
-        data = self._request("auth.info", {})
-        if not isinstance(data, dict) or "user" not in data:
-            raise OutlineProtocolError("auth_info_invalid")
+        """Verify connectivity and credentials with a minimal listing.
+
+        ``auth.info`` succeeds for any valid token, including one with no
+        read access to documents, so it would report success while the
+        sync's only real call - ``documents.list`` - returns 403. Probing
+        the listing endpoint proves the permission actually needed; the
+        page size is capped at one so the probe stays cheap.
+        """
+        self.list_documents(limit=1)
 
     def list_documents(
         self,
@@ -92,18 +108,32 @@ class OutlineClient:
         if self._collections_cache is None:
             cache: dict[str, str] = {}
             offset = 0
+            fetched = 0
             while True:
-                batch = self._list_collections(offset=offset, limit=100)
+                batch = self._list_collections(
+                    offset=offset, limit=_COLLECTIONS_PAGE_SIZE
+                )
+                if not batch:
+                    break
                 for collection in batch:
+                    if not isinstance(collection, dict):
+                        raise OutlineProtocolError(
+                            "collection_entry_not_object"
+                        )
                     collection_id_value = collection.get("id")
                     name = collection.get("name")
                     if isinstance(collection_id_value, str) and isinstance(
                         name, str
                     ):
                         cache[collection_id_value] = name
-                if len(batch) < 100:
+                if len(batch) < _COLLECTIONS_PAGE_SIZE:
                     break
                 offset += len(batch)
+                # Count rows fetched, not rows cached: a server replaying the
+                # same page forever never grows the cache.
+                fetched += len(batch)
+                if fetched > _MAX_PAGINATED_COLLECTIONS:
+                    raise OutlineProtocolError("pagination_not_terminating")
             self._collections_cache = cache
         return self._collections_cache.get(collection_id, "")
 
@@ -144,6 +174,12 @@ class OutlineClient:
             raise OutlineConnectionError("url_error") from error
         except (OSError, socket.gaierror, TimeoutError) as error:
             raise OutlineConnectionError("connect_failed") from error
+        except ValueError:
+            # ``http.client`` rejects a malformed header value with a
+            # ``ValueError`` whose message quotes the header - including the
+            # bearer token. Re-raise with a static rule and no ``__cause__``
+            # so the token cannot ride out in a message or a traceback.
+            raise OutlineProtocolError("invalid_request") from None
 
         if len(raw) > _MAX_JSON_BYTES:
             raise OutlineProtocolError("response_too_large")
