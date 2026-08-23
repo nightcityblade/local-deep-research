@@ -99,3 +99,16 @@ def test_metadata_json_is_canonical() -> None:
 def test_empty_content_raises() -> None:
     with pytest.raises(MemosContentError, match="empty_content"):
         map_memos_memo(_item(), _raw(content="   "))
+
+
+def test_source_url_is_inert_for_hostile_uids() -> None:
+    """Memos builds ``source_url`` itself, so a server cannot inject a scheme.
+
+    Pinned deliberately: the sibling providers pass a server-supplied URL
+    through, where a ``javascript:`` value would be rendered as an
+    ``<a href>`` on the document details page.
+    """
+    raw = _raw(memo_uid="javascript:alert(1)")
+    document = map_memos_memo(_item(), raw)
+    assert document.source_url == "memos://memo/javascript:alert(1)"
+    assert document.source_url.startswith("memos://memo/")

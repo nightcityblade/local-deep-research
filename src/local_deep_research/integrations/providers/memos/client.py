@@ -22,7 +22,14 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# ``ProxyHandler({})`` replaces urllib's default handler, which reads
+# ``http_proxy``/``https_proxy``/``ALL_PROXY`` from the environment. Integration
+# traffic carries a bearer token, so it must never be routed through a third
+# party because of an unrelated environment variable (the project uses
+# ``trust_env = False`` for the same reason elsewhere).
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
 
 
 class MemosClient:
@@ -48,7 +55,7 @@ class MemosClient:
         self.close()
 
     def __repr__(self) -> str:
-        return f"MemosClient(base_url={self._config.api_url!r})"
+        return f"MemosClient(base_url={self._config.base_url!r})"
 
     @property
     def config(self) -> MemosProviderConfig:
@@ -121,6 +128,12 @@ class MemosClient:
             raise MemosConnectionError("url_error") from error
         except (OSError, socket.gaierror, TimeoutError) as error:
             raise MemosConnectionError("connect_failed") from error
+        except ValueError:
+            # ``http.client`` rejects a malformed header value with a
+            # ``ValueError`` whose message quotes the header - including the
+            # bearer token. Re-raise with a static rule and no ``__cause__``
+            # so the token cannot ride out in a message or a traceback.
+            raise MemosProtocolError("invalid_request") from None
 
         if len(raw) > _MAX_JSON_BYTES:
             raise MemosProtocolError("response_too_large")

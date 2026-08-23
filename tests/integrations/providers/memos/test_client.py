@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
+import subprocess
+import sys
 import urllib.error
 from urllib.parse import parse_qs, urlsplit
 
@@ -272,3 +275,62 @@ def test_get_memo_url_encodes_uid_unsafe_chars(
     # The slash in "a/b" is percent-encoded to %2F.
     assert "%2F" in req.full_url
     assert "/memos/a/b" not in req.full_url.split("?")[0]
+
+
+def test_transport_value_error_never_leaks_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``http.client`` quotes the whole header value in its ``ValueError``.
+
+    That message carries the bearer token, so it must be converted to a
+    static rule code and its context suppressed rather than escaping the
+    provider's error taxonomy.
+    """
+    _install_urlopen_error(
+        monkeypatch,
+        ValueError("Invalid header value b'Bearer secret-token\\n'"),
+    )
+    with pytest.raises(MemosProtocolError) as excinfo:
+        MemosClient(_config()).probe()
+    assert str(excinfo.value) == "memos_protocol:invalid_request"
+    assert "secret-token" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_repr_labels_the_base_url_field() -> None:
+    """``__repr__`` must not label the derived API URL as ``base_url``."""
+    assert repr(MemosClient(_config())) == (
+        "MemosClient(base_url='https://memos.example.com')"
+    )
+
+
+def test_opener_ignores_environment_proxies() -> None:
+    """``http_proxy``/``https_proxy``/``ALL_PROXY`` must not capture traffic.
+
+    The opener is built at import time, so the check runs in a subprocess
+    with the proxy variables set: urllib's default ``ProxyHandler`` would
+    register itself from the environment and route token-bearing requests
+    through a third party.
+    """
+    code = (
+        "import urllib.request\n"
+        "from local_deep_research.integrations.providers.memos "
+        "import client as c\n"
+        "print(any(isinstance(h, urllib.request.ProxyHandler) "
+        "for h in c._OPENER.handlers))\n"
+    )
+    env = {
+        **os.environ,
+        "http_proxy": "http://proxy.invalid:3128",
+        "https_proxy": "http://proxy.invalid:3128",
+        "ALL_PROXY": "http://proxy.invalid:3128",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "False", result.stderr

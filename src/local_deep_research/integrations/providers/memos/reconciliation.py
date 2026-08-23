@@ -1,3 +1,12 @@
+"""Memos snapshot reconciliation.
+
+Known limitation: ``provider_revision`` is derived from the server's own
+change markers (``updateTime`` and the pinned flag) and never hashes the item's content. The listing
+endpoint does not return content, so hashing it would cost one extra request
+per item on every sync. A server that omits those markers therefore reports a
+constant revision for every item and edits are not re-synced.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +19,10 @@ from .client import MemosClient
 from .errors import MemosProtocolError
 
 _PAGE_SIZE = 100
+
+# Safety valve against a server that keeps returning a non-empty page and a
+# constant page token forever; exposed as a module constant for tests.
+_MAX_PAGINATED_MEMOS = 500_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,12 +51,16 @@ def fetch_memos_snapshot(client: MemosClient) -> RemoteSnapshot:
         batch, page_token = client.list_memos(
             page_token=page_token, page_size=_PAGE_SIZE
         )
+        if not batch:
+            break
         all_memos.extend(batch)
         if not page_token:
             break
-
-    if config.max_memos > 0 and len(all_memos) > config.max_memos:
-        all_memos = all_memos[: config.max_memos]
+        if config.max_memos > 0 and len(all_memos) >= config.max_memos:
+            # The cap bounds the fetch itself, not just the result.
+            break
+        if len(all_memos) > _MAX_PAGINATED_MEMOS:
+            raise MemosProtocolError("pagination_not_terminating")
 
     if not all_memos:
         raise MemosProtocolError("no_memos")
@@ -51,6 +68,8 @@ def fetch_memos_snapshot(client: MemosClient) -> RemoteSnapshot:
     items: list[RemoteSnapshotItem] = []
     seen: set[str] = set()
     for memo in all_memos:
+        if not isinstance(memo, dict):
+            raise MemosProtocolError("memo_entry_not_object")
         memo_name = str(memo.get("name", ""))
         if not memo_name or memo_name in seen:
             continue
@@ -71,6 +90,11 @@ def fetch_memos_snapshot(client: MemosClient) -> RemoteSnapshot:
     items.sort(key=lambda si: si.external_id)
     if not items:
         raise MemosProtocolError("no_valid_memos")
+    if config.max_memos > 0:
+        # Truncate after sorting: truncating the server's own listing order
+        # would select a different subset whenever that order changes, and
+        # items missing from a snapshot are marked for removal.
+        items = items[: config.max_memos]
 
     triples = [
         [si.external_id, si.provider_revision, si.revision] for si in items

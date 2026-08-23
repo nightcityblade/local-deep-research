@@ -121,8 +121,14 @@ def test_snapshot_paginates_via_page_token() -> None:
 
 
 def test_snapshot_respects_max_memos() -> None:
+    """The cap selects the lowest names, not whatever the server listed first.
+
+    Truncating the server's own order made the retained set depend on a
+    listing order that may vary between runs, and items missing from a
+    snapshot are marked ``pending_removal``.
+    """
     client = _FakeClient(
-        pages=[([_memo("a"), _memo("b"), _memo("c")], "")],
+        pages=[([_memo("c"), _memo("b"), _memo("a")], "")],
         memos={},
         config=_config(max_memos=2),
     )
@@ -131,6 +137,56 @@ def test_snapshot_respects_max_memos() -> None:
         "memos/a",
         "memos/b",
     )
+
+
+def test_snapshot_max_memos_bounds_the_fetch() -> None:
+    """The cap stops paging; it is not applied after fetching everything."""
+    client = _FakeClient(
+        pages=[([_memo("a"), _memo("b")], "same-token")] * 5,
+        memos={},
+        config=_config(max_memos=2),
+    )
+    snapshot = fetch_memos_snapshot(client)
+    assert snapshot.expected_count == 2
+    assert len(client.list_calls) == 1
+
+
+def test_snapshot_terminates_on_empty_page_with_a_repeating_token() -> None:
+    """An empty page ends pagination even when the token never changes.
+
+    A server answering ``{"memos": [], "nextPageToken": "same"}`` forever
+    span the loop without ever growing memory, so it hung indefinitely
+    rather than failing.
+    """
+    client = _FakeClient(
+        pages=[([_memo("a")], "same-token"), ([], "same-token")],
+        memos={},
+    )
+    snapshot = fetch_memos_snapshot(client)
+    assert snapshot.expected_count == 1
+    assert len(client.list_calls) == 2
+
+
+def test_snapshot_non_terminating_page_token_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full page plus a constant token must trip the safety valve."""
+    import local_deep_research.integrations.providers.memos.reconciliation as recon
+
+    monkeypatch.setattr(recon, "_MAX_PAGINATED_MEMOS", 3)
+    client = _FakeClient(
+        pages=[([_memo("a"), _memo("b")], "same-token")] * 5,
+        memos={},
+    )
+    with pytest.raises(MemosProtocolError, match="pagination_not_terminating"):
+        fetch_memos_snapshot(client)
+
+
+def test_snapshot_non_dict_entry_raises() -> None:
+    """A non-dict list element must stay inside the error taxonomy."""
+    client = _FakeClient(pages=[(["not-a-dict"], "")], memos={})
+    with pytest.raises(MemosProtocolError, match="memo_entry_not_object"):
+        fetch_memos_snapshot(client)  # type: ignore[arg-type]
 
 
 def test_snapshot_accepts_alternate_timestamp_spelling() -> None:
